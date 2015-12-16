@@ -5,7 +5,7 @@ local char     = string.char
 local byte     = string.byte
 
 local function byt(c)
-    return format('%02x', byte(c or ""))
+    return format("%02x", byte(c or ""))
 end
 
 local function chr(c)

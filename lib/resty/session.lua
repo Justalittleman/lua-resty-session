@@ -1,30 +1,18 @@
-local ngx_var      = ngx.var
-local ngx_header   = ngx.header
+local require      = require
+local random       = require "resty.random".bytes
+local ngx          = ngx
+local var          = ngx.var
+local header       = ngx.header
 local concat       = table.concat
 local hmac         = ngx.hmac_sha1
 local time         = ngx.time
 local http_time    = ngx.http_time
 local type         = type
+local pcall        = pcall
+local ipairs       = ipairs
+local tonumber     = tonumber
 local setmetatable = setmetatable
-local ffi          = require "ffi"
-local ffi_cdef     = ffi.cdef
-local ffi_new      = ffi.new
-local ffi_str      = ffi.string
-local ffi_typeof   = ffi.typeof
-local C            = ffi.C
-
-ffi_cdef[[
-typedef unsigned char u_char;
-int RAND_bytes(u_char *buf, int num);
-]]
-
-local t = ffi_typeof "uint8_t[?]"
-
-local function random(len)
-    local s = ffi_new(t, len)
-    C.RAND_bytes(s, len)
-    return ffi_str(s, len)
-end
+local getmetatable = getmetatable
 
 local function enabled(val)
     if val == nil then return nil end
@@ -57,7 +45,7 @@ local function setcookie(session, value, expires)
     end
     local needle = concat(cookie, nil, 1, 2)
     cookie = concat(cookie)
-    local cookies = ngx_header["Set-Cookie"]
+    local cookies = header["Set-Cookie"]
     local t = type(cookies)
     if t == "table" then
         local found = false
@@ -76,7 +64,7 @@ local function setcookie(session, value, expires)
     else
         cookies = cookie
     end
-    ngx_header["Set-Cookie"] = cookies
+    header["Set-Cookie"] = cookies
     return true
 end
 
@@ -95,7 +83,7 @@ end
 
 local function regenerate(session, flush)
     local i = session.present and session.id or nil
-    session.id = random(session.identifier.length)
+    session.id = session.identifiers.new(session)
     if flush then
         if i and session.storage.destroy then
             session.storage:destroy(i);
@@ -104,32 +92,32 @@ local function regenerate(session, flush)
     end
 end
 
-local persistent = enabled(ngx_var.session_cookie_persistent or false)
+local persistent = enabled(var.session_cookie_persistent or false)
 local defaults = {
-    name       = ngx_var.session_name       or "session",
-    storage    = ngx_var.session_storage    or "cookie",
-    serializer = ngx_var.session_serializer or "json",
-    encoder    = ngx_var.session_encoder    or "base64",
-    cipher     = ngx_var.session_cipher     or "aes",
+    name       = var.session_name       or "session",
+    storage    = var.session_storage    or "cookie",
+    serializer = var.session_serializer or "json",
+    encoder    = var.session_encoder    or "base64",
+    cipher     = var.session_cipher     or "aes",
     cookie = {
         persistent = persistent,
-        renew      = tonumber(ngx_var.session_cookie_renew)    or 600,
-        lifetime   = tonumber(ngx_var.session_cookie_lifetime) or 3600,
-        path       = ngx_var.session_cookie_path               or "/",
-        domain     = ngx_var.session_cookie_domain,
-        secure     = enabled(ngx_var.session_cookie_secure),
-        httponly   = enabled(ngx_var.session_cookie_httponly   or true),
-        delimiter  = ngx_var.session_cookie_delimiter          or "|"
+        renew      = tonumber(var.session_cookie_renew)    or 600,
+        lifetime   = tonumber(var.session_cookie_lifetime) or 3600,
+        path       = var.session_cookie_path               or "/",
+        domain     = var.session_cookie_domain,
+        secure     = enabled(var.session_cookie_secure),
+        httponly   = enabled(var.session_cookie_httponly   or true),
+        delimiter  = var.session_cookie_delimiter          or "|"
     }, check = {
-        ssi    = enabled(ngx_var.session_check_ssi    or persistent == false),
-        ua     = enabled(ngx_var.session_check_ua     or true),
-        scheme = enabled(ngx_var.session_check_scheme or true),
-        addr   = enabled(ngx_var.session_check_addr   or false)
+        ssi    = enabled(var.session_check_ssi    or persistent == false),
+        ua     = enabled(var.session_check_ua     or true),
+        scheme = enabled(var.session_check_scheme or true),
+        addr   = enabled(var.session_check_addr   or false)
     }, identifier = {
-        length  = tonumber(ngx_var.session_identifier_length) or 16
+        generator = tonumber(var.session_identifier_generator) or "random"
     }
 }
-defaults.secret = ngx_var.session_secret or random(32)
+defaults.secret = var.session_secret or random(32, true)
 
 local session = {
     _VERSION = "2.2"
@@ -163,6 +151,10 @@ function session.new(opts)
     if not o then
         l = require "resty.session.ciphers.aes"
     end
+    local o, m = pcall(require, "resty.session.identifiers." .. (g.generator or h.generator))
+    if not o then
+        m = require "resty.session.identifiers.random"
+    end
     local self = {
         name       = y.name    or z.name,
         serializer = j,
@@ -183,10 +175,9 @@ function session.new(opts)
             ua         = c.ua         or d.ua,
             scheme     = c.scheme     or d.scheme,
             addr       = c.addr       or d.addr
-        }, identifier = {
-            length     = g.length     or h.length
         }
     }
+    self.identifiers = m.new(self)
     self.storage = i.new(self)
     self.cipher = l.new(self)
     return setmetatable(self, session)
@@ -201,23 +192,23 @@ function session.open(opts)
     else
         self = session.new(opts)
     end
-    local scheme = ngx_header["X-Forwarded-Proto"]
+    local scheme = header["X-Forwarded-Proto"]
     if self.cookie.secure == nil then
         if scheme then
             self.cookie.secure = scheme == "https"
         else
-            self.cookie.secure = ngx_var.https == "on"
+            self.cookie.secure = var.https == "on"
         end
     end
-    scheme = self.check.scheme and (scheme or ngx_var.scheme or "") or ""
+    scheme = self.check.scheme and (scheme or var.scheme or "") or ""
     local addr = ""
     if self.check.addr then
-        addr = ngx_header["CF-Connecting-IP"] or
-               ngx_header["Fastly-Client-IP"] or
-               ngx_header["Incap-Client-IP"]  or
-               ngx_header["X-Real-IP"]
+        addr = header["CF-Connecting-IP"] or
+               header["Fastly-Client-IP"] or
+               header["Incap-Client-IP"]  or
+               header["X-Real-IP"]
         if not addr then
-            addr = ngx_header["X-Forwarded-For"]
+            addr = header["X-Forwarded-For"]
             if addr then
                 -- We shouldn't really get the left-most address, because of spoofing,
                 -- but this is better handled with a module, like nginx realip module,
@@ -227,17 +218,17 @@ function session.open(opts)
                     addr = addr:sub(1, s - 1)
                 end
             else
-                addr = ngx_var.remote_addr
+                addr = var.remote_addr
             end
         end
     end
     self.key = concat{
-        self.check.ssi and (ngx_var.ssl_session_id  or "") or "",
-        self.check.ua  and (ngx_var.http_user_agent or "") or "",
+        self.check.ssi and (var.ssl_session_id  or "") or "",
+        self.check.ua  and (var.http_user_agent or "") or "",
         addr,
         scheme
     }
-    local cookie = ngx_var["cookie_" .. self.name]
+    local cookie = var["cookie_" .. self.name]
     if cookie then
         local i, e, d, h = self.storage:open(cookie, self.cookie.lifetime)
         if i and e and e > time() and d and h then
